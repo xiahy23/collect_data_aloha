@@ -1,0 +1,11 @@
+# 采集的数据文件
+*.hdf5
+*.h5
+*.mp4
+*.avi
+*.bag
+__pycache__/
+*.pyc
+*.log
+/data/
+/episodes/
