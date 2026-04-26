@@ -42,6 +42,7 @@ from cv_bridge import CvBridge
 from sensor_msgs.msg import Image, JointState
 
 from dataarm_notifier import RecordingController
+from go_home import go_home_and_wait
 
 
 # ------------------------------------------------------------------
@@ -570,17 +571,37 @@ class CollectorWorker(threading.Thread):
             return
 
         self.ui_queue.put(("saving", True))
+        save_ok = False
         try:
             dataset_path = os.path.join(meta["folder"], f"episode_{meta['idx']}")
             save_episode(self.args, timesteps, actions, dataset_path, meta["instruction"])
             self.ui_queue.put(("status",
                 f"Saved episode_{meta['idx']} ({len(actions)} frames) :: {meta['instruction']}"))
-            self.ui_queue.put(("episode_saved", meta))
+            save_ok = True
         except Exception as exc:
             self.ui_queue.put(("status", f"[ERROR] save failed: {exc}"))
-        finally:
-            self.ui_queue.put(("saving", False))
-            self.ui_queue.put(("recording", False))
+        self.ui_queue.put(("saving", False))
+
+        # 保存成功后, 自动主从臂回零; 回零真正完成才解锁下一次采集.
+        if save_ok and getattr(self.args, "auto_home", True):
+            self.ui_queue.put(("homing", True))
+            try:
+                home_ok = go_home_and_wait(
+                    pos_threshold=self.args.home_pos_threshold,
+                    vel_threshold=self.args.home_vel_threshold,
+                    stable_seconds=self.args.home_stable_seconds,
+                    timeout=self.args.home_timeout,
+                    log=lambda m: self.ui_queue.put(("status", m)),
+                )
+            except Exception as exc:
+                self.ui_queue.put(("status", f"[ERROR] homing exception: {exc}"))
+                home_ok = False
+            self.ui_queue.put(("homing", False))
+            self.ui_queue.put(("home_result", home_ok))
+
+        if save_ok:
+            self.ui_queue.put(("episode_saved", meta))
+        self.ui_queue.put(("recording", False))
 
 
 # ------------------------------------------------------------------
@@ -708,6 +729,22 @@ class CollectorApp:
                 self.controller.start()
             except Exception as exc:
                 self.ui_queue.put(("status", f"[WARN] pedal/lamp unavailable: {exc}"))
+            # 启动时先回零并恢复示教模式，确保主臂处于可拖拽状态
+            if getattr(self.args, "auto_home", True):
+                self.ui_queue.put(("homing", True))
+                try:
+                    home_ok = go_home_and_wait(
+                        pos_threshold=self.args.home_pos_threshold,
+                        vel_threshold=self.args.home_vel_threshold,
+                        stable_seconds=self.args.home_stable_seconds,
+                        timeout=self.args.home_timeout,
+                        log=lambda m: self.ui_queue.put(("status", m)),
+                    )
+                except Exception as exc:
+                    self.ui_queue.put(("status", f"[ERROR] startup homing: {exc}"))
+                    home_ok = False
+                self.ui_queue.put(("homing", False))
+                self.ui_queue.put(("home_result", home_ok))
             self.ui_queue.put(("status", "Ready. Select an instruction and press Start (or pedal)."))
             self.ui_queue.put(("ready", True))
         threading.Thread(target=_wait, daemon=True).start()
@@ -852,6 +889,18 @@ class CollectorApp:
                 elif kind == "saving":
                     if payload:
                         self._set_lamp("#ffcc00")
+                elif kind == "homing":
+                    if payload:
+                        self._set_lamp("#cc66ff")  # purple
+                        self.btn_start.config(state=tk.DISABLED)
+                        self.btn_stop.config(state=tk.DISABLED)
+                        self.btn_next.config(state=tk.DISABLED)
+                        self.status_var.set("Returning to home (master+slave)...")
+                elif kind == "home_result":
+                    if payload:
+                        self.status_var.set("Home reached. Ready for next episode.")
+                    else:
+                        self.status_var.set("[WARN] Home timeout/failure. Please verify arms manually.")
                 elif kind == "frames":
                     self.status_var.set(f"Recording... {payload}/{self.args.max_timesteps} frames")
                 elif kind == "episode_aborted":
@@ -931,6 +980,20 @@ def get_arguments():
         "--instructions", nargs="*", default=None,
         help="Optional: seed initial instruction list (only when meta is empty).",
     )
+    # 主从臂自动回零相关
+    parser.add_argument("--auto_home", dest="auto_home", action="store_true",
+                        help="保存成功后自动主从臂回零 (默认开启)")
+    parser.add_argument("--no_auto_home", dest="auto_home", action="store_false",
+                        help="关闭保存后自动回零")
+    parser.set_defaults(auto_home=True)
+    parser.add_argument("--home_pos_threshold", type=float, default=0.1,
+                        help="回零完成位置阈值 (rad)")
+    parser.add_argument("--home_vel_threshold", type=float, default=0.1,
+                        help="回零完成速度阈值")
+    parser.add_argument("--home_stable_seconds", type=float, default=0.2,
+                        help="满足阈值的持续时间")
+    parser.add_argument("--home_timeout", type=float, default=6.0,
+                        help="回零等待超时 (s)")
     return parser.parse_args()
 
 
