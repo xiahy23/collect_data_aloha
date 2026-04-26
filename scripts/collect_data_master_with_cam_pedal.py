@@ -1,6 +1,9 @@
 # -- coding: UTF-8
 """
-Pedal/Enter-controlled master-arm + camera data collection.
+Pedal/Enter-controlled master-slave + camera data collection.
+
+    Observation (qpos/qvel/effort) <- 双从臂 (puppet)
+    Action <- 双主臂 (master) 操作者下发指令
 
 Workflow:
     1. Start process and wait for ROS topics to become ready.
@@ -118,6 +121,8 @@ class PedalControlledCollector:
         self.img_right_deque = deque()
         self.master_arm_left_deque = deque()
         self.master_arm_right_deque = deque()
+        self.puppet_arm_left_deque = deque()
+        self.puppet_arm_right_deque = deque()
 
         self.state_lock = threading.Lock()
         self.is_recording = False
@@ -135,7 +140,7 @@ class PedalControlledCollector:
         self.controller.on_recording_start(self.handle_recording_start)
         self.controller.on_recording_stop(self.handle_recording_stop)
 
-        rospy.init_node("record_episodes_master_cam_pedal", anonymous=True)
+        rospy.init_node("record_episodes_master_slave_cam_pedal", anonymous=True)
 
         rospy.Subscriber(args.img_front_topic, Image, self._img_front_cb, queue_size=1000, tcp_nodelay=True)
         rospy.Subscriber(args.img_left_topic, Image, self._img_left_cb, queue_size=1000, tcp_nodelay=True)
@@ -145,6 +150,12 @@ class PedalControlledCollector:
         )
         rospy.Subscriber(
             args.master_arm_right_topic, JointState, self._master_right_cb, queue_size=1000, tcp_nodelay=True
+        )
+        rospy.Subscriber(
+            args.puppet_arm_left_topic, JointState, self._puppet_left_cb, queue_size=1000, tcp_nodelay=True
+        )
+        rospy.Subscriber(
+            args.puppet_arm_right_topic, JointState, self._puppet_right_cb, queue_size=1000, tcp_nodelay=True
         )
 
     def _img_front_cb(self, msg):
@@ -172,6 +183,16 @@ class PedalControlledCollector:
             self.master_arm_right_deque.popleft()
         self.master_arm_right_deque.append(msg)
 
+    def _puppet_left_cb(self, msg):
+        if len(self.puppet_arm_left_deque) >= 2000:
+            self.puppet_arm_left_deque.popleft()
+        self.puppet_arm_left_deque.append(msg)
+
+    def _puppet_right_cb(self, msg):
+        if len(self.puppet_arm_right_deque) >= 2000:
+            self.puppet_arm_right_deque.popleft()
+        self.puppet_arm_right_deque.append(msg)
+
     def wait_until_ready(self):
         print("Waiting for cameras and master-arm topics...")
         rate = rospy.Rate(50)
@@ -183,6 +204,8 @@ class PedalControlledCollector:
                 and len(self.img_right_deque) > 0
                 and len(self.master_arm_left_deque) > 0
                 and len(self.master_arm_right_deque) > 0
+                and len(self.puppet_arm_left_deque) > 0
+                and len(self.puppet_arm_right_deque) > 0
             )
             if ready:
                 print("\033[32mAll streams are ready.\033[0m")
@@ -199,14 +222,21 @@ class PedalControlledCollector:
                     missing.append(self.args.master_arm_left_topic)
                 if len(self.master_arm_right_deque) == 0:
                     missing.append(self.args.master_arm_right_topic)
+                if len(self.puppet_arm_left_deque) == 0:
+                    missing.append(self.args.puppet_arm_left_topic)
+                if len(self.puppet_arm_right_deque) == 0:
+                    missing.append(self.args.puppet_arm_right_topic)
                 raise RuntimeError(f"Timed out waiting for topics: {missing}")
             rate.sleep()
 
-        print("Waiting for stable master-arm CAN data...")
+        print("Waiting for stable master/puppet CAN data...")
         t_can = time.time()
         while not rospy.is_shutdown():
-            if self._arm_valid(self.master_arm_left_deque) and self._arm_valid(self.master_arm_right_deque):
-                print("\033[32mMaster-arm CAN data is valid.\033[0m")
+            if (self._arm_valid(self.master_arm_left_deque)
+                    and self._arm_valid(self.master_arm_right_deque)
+                    and self._arm_valid(self.puppet_arm_left_deque)
+                    and self._arm_valid(self.puppet_arm_right_deque)):
+                print("\033[32mMaster/puppet CAN data is valid.\033[0m")
                 return
             if time.time() - t_can > 5.0:
                 print("[WARN] Joint data still near zero; continue anyway.")
@@ -227,6 +257,8 @@ class PedalControlledCollector:
             or len(self.img_right_deque) == 0
             or len(self.master_arm_left_deque) == 0
             or len(self.master_arm_right_deque) == 0
+            or len(self.puppet_arm_left_deque) == 0
+            or len(self.puppet_arm_right_deque) == 0
         ):
             return None
 
@@ -236,6 +268,8 @@ class PedalControlledCollector:
             self.img_right_deque[-1].header.stamp.to_sec(),
             self.master_arm_left_deque[-1].header.stamp.to_sec(),
             self.master_arm_right_deque[-1].header.stamp.to_sec(),
+            self.puppet_arm_left_deque[-1].header.stamp.to_sec(),
+            self.puppet_arm_right_deque[-1].header.stamp.to_sec(),
         )
 
         while self.img_front_deque[0].header.stamp.to_sec() < frame_time:
@@ -258,10 +292,18 @@ class PedalControlledCollector:
             self.master_arm_right_deque.popleft()
         master_right = self.master_arm_right_deque.popleft()
 
+        while self.puppet_arm_left_deque[0].header.stamp.to_sec() < frame_time:
+            self.puppet_arm_left_deque.popleft()
+        puppet_left = self.puppet_arm_left_deque.popleft()
+
+        while self.puppet_arm_right_deque[0].header.stamp.to_sec() < frame_time:
+            self.puppet_arm_right_deque.popleft()
+        puppet_right = self.puppet_arm_right_deque.popleft()
+
         img_front = cv2.resize(img_front, (640, 480))
         img_left = cv2.resize(img_left, (640, 480))
         img_right = cv2.resize(img_right, (640, 480))
-        return img_front, img_left, img_right, master_left, master_right
+        return img_front, img_left, img_right, master_left, master_right, puppet_left, puppet_right
 
     def handle_recording_start(self):
         with self.state_lock:
@@ -315,11 +357,17 @@ class PedalControlledCollector:
         print(f"[INFO] Ready for next episode. Next index: {self.next_episode_idx}")
 
     def append_recording_step(self, result):
-        img_front, img_left, img_right, master_left, master_right = result
+        (img_front, img_left, img_right,
+         master_left, master_right,
+         puppet_left, puppet_right) = result
 
-        qpos = np.concatenate((np.array(master_left.position), np.array(master_right.position)), axis=0)
-        qvel = np.concatenate((np.array(master_left.velocity), np.array(master_right.velocity)), axis=0)
-        effort = np.concatenate((np.array(master_left.effort), np.array(master_right.effort)), axis=0)
+        # observation <- 从臂 (puppet) 实际状态
+        qpos = np.concatenate((np.array(puppet_left.position), np.array(puppet_right.position)), axis=0)
+        qvel = np.concatenate((np.array(puppet_left.velocity), np.array(puppet_right.velocity)), axis=0)
+        effort = np.concatenate((np.array(puppet_left.effort), np.array(puppet_right.effort)), axis=0)
+
+        # action <- 主臂 (master) 下发指令
+        action = np.concatenate((np.array(master_left.position), np.array(master_right.position)), axis=0)
 
         obs = {
             "qpos": qpos,
@@ -331,7 +379,6 @@ class PedalControlledCollector:
                 self.args.camera_names[2]: img_right,
             },
         }
-        action = qpos.copy()
 
         with self.state_lock:
             episode = self.current_episode
@@ -357,7 +404,10 @@ class PedalControlledCollector:
 
     def run(self):
         self.wait_until_ready()
-        self.controller.start()
+        try:
+            self.controller.start()
+        except Exception as exc:
+            print(f"[WARN] pedal/lamp unavailable: {exc}. Use keyboard Enter to control recording.")
         print(
             "\nPedal-controlled collector is ready.\n"
             "Press pedal/Enter once to start recording, press again to stop and save.\n"
@@ -405,6 +455,8 @@ def get_arguments():
     parser.add_argument("--img_right_topic", type=str, default="/camera_r/color/image_raw")
     parser.add_argument("--master_arm_left_topic", type=str, default="/master/joint_left")
     parser.add_argument("--master_arm_right_topic", type=str, default="/master/joint_right")
+    parser.add_argument("--puppet_arm_left_topic", type=str, default="/puppet/joint_left")
+    parser.add_argument("--puppet_arm_right_topic", type=str, default="/puppet/joint_right")
     parser.add_argument("--frame_rate", type=int, default=30)
     parser.add_argument("--jpeg_quality", type=int, default=90)
     parser.add_argument("--lamp_port", type=str, default=None)

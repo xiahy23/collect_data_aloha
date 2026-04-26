@@ -103,6 +103,12 @@ class KeyboardListener:
     def _read_loop(self):
         try:
             resolved_path = self._pick_device_path()
+        except Exception as exc:
+            print(f"[ERROR] pedal: cannot find device: {exc}")
+            print("[HINT]  Run: sudo usermod -aG input $USER  then log out/in")
+            self._listening = False
+            return
+        try:
             self._device = InputDevice(resolved_path)
             self.device_path = resolved_path
             print(

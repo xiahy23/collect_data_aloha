@@ -1,6 +1,6 @@
 # -- coding: UTF-8
 """
-主臂 + 相机数据采集脚本（无从臂）
+主从遥操 + 相机 数据采集脚本
 
 用法:
     python collect_data_master_with_cam.py \
@@ -8,11 +8,13 @@
         --max_timesteps 500 --episode_idx 0
 
 说明:
-    - 采集双主臂关节数据 + 3 个相机 RGB 图像
-    - 无从臂：主臂 qpos 同时作为 observation 和 action
-    - 输出 HDF5 文件，图像以 JPEG 二进制保存以节省空间
-    - 相机话题默认: /camera_f/color/image_raw, /camera_l/color/image_raw, /camera_r/color/image_raw
+    - 主从模式: 操作者拖拽主臂, 从臂跟随主臂
+    - observation(qpos/qvel/effort) 来自双从臂 (puppet)
+    - action 来自双主臂 (master) —— 即操作者下发的指令
+    - 相机位于从臂上, 话题默认: /camera_f/color/image_raw, /camera_l/color/image_raw, /camera_r/color/image_raw
     - 主臂话题默认: /master/joint_left, /master/joint_right
+    - 从臂话题默认: /puppet/joint_left, /puppet/joint_right
+    - 输出 HDF5 文件, 图像以 JPEG 二进制保存以节省空间
 """
 import os
 import time
@@ -98,8 +100,10 @@ class RosOperator:
         self.img_right_deque = deque()
         self.master_arm_left_deque = deque()
         self.master_arm_right_deque = deque()
+        self.puppet_arm_left_deque = deque()
+        self.puppet_arm_right_deque = deque()
 
-        rospy.init_node("record_episodes_master_cam", anonymous=True)
+        rospy.init_node("record_episodes_master_slave_cam", anonymous=True)
 
         rospy.Subscriber(
             args.img_front_topic, Image, self._img_front_cb, queue_size=1000, tcp_nodelay=True
@@ -110,7 +114,6 @@ class RosOperator:
         rospy.Subscriber(
             args.img_right_topic, Image, self._img_right_cb, queue_size=1000, tcp_nodelay=True
         )
-
         rospy.Subscriber(
             args.master_arm_left_topic,
             JointState,
@@ -122,6 +125,20 @@ class RosOperator:
             args.master_arm_right_topic,
             JointState,
             self._master_right_cb,
+            queue_size=1000,
+            tcp_nodelay=True,
+        )
+        rospy.Subscriber(
+            args.puppet_arm_left_topic,
+            JointState,
+            self._puppet_left_cb,
+            queue_size=1000,
+            tcp_nodelay=True,
+        )
+        rospy.Subscriber(
+            args.puppet_arm_right_topic,
+            JointState,
+            self._puppet_right_cb,
             queue_size=1000,
             tcp_nodelay=True,
         )
@@ -151,15 +168,30 @@ class RosOperator:
             self.master_arm_right_deque.popleft()
         self.master_arm_right_deque.append(msg)
 
+    def _puppet_left_cb(self, msg):
+        if len(self.puppet_arm_left_deque) >= 2000:
+            self.puppet_arm_left_deque.popleft()
+        self.puppet_arm_left_deque.append(msg)
+
+    def _puppet_right_cb(self, msg):
+        if len(self.puppet_arm_right_deque) >= 2000:
+            self.puppet_arm_right_deque.popleft()
+        self.puppet_arm_right_deque.append(msg)
+
+    def _all_deques(self):
+        return (
+            self.img_front_deque,
+            self.img_left_deque,
+            self.img_right_deque,
+            self.master_arm_left_deque,
+            self.master_arm_right_deque,
+            self.puppet_arm_left_deque,
+            self.puppet_arm_right_deque,
+        )
+
     def get_synced_frame(self):
         """取所有队列的最近公共时间戳并拉齐数据。"""
-        if (
-            len(self.img_front_deque) == 0
-            or len(self.img_left_deque) == 0
-            or len(self.img_right_deque) == 0
-            or len(self.master_arm_left_deque) == 0
-            or len(self.master_arm_right_deque) == 0
-        ):
+        if any(len(dq) == 0 for dq in self._all_deques()):
             return None
 
         frame_time = min(
@@ -168,6 +200,8 @@ class RosOperator:
             self.img_right_deque[-1].header.stamp.to_sec(),
             self.master_arm_left_deque[-1].header.stamp.to_sec(),
             self.master_arm_right_deque[-1].header.stamp.to_sec(),
+            self.puppet_arm_left_deque[-1].header.stamp.to_sec(),
+            self.puppet_arm_right_deque[-1].header.stamp.to_sec(),
         )
 
         while self.img_front_deque[0].header.stamp.to_sec() < frame_time:
@@ -190,44 +224,57 @@ class RosOperator:
             self.master_arm_right_deque.popleft()
         master_right = self.master_arm_right_deque.popleft()
 
+        while self.puppet_arm_left_deque[0].header.stamp.to_sec() < frame_time:
+            self.puppet_arm_left_deque.popleft()
+        puppet_left = self.puppet_arm_left_deque.popleft()
+
+        while self.puppet_arm_right_deque[0].header.stamp.to_sec() < frame_time:
+            self.puppet_arm_right_deque.popleft()
+        puppet_right = self.puppet_arm_right_deque.popleft()
+
         img_front = cv2.resize(img_front, (640, 480))
         img_left = cv2.resize(img_left, (640, 480))
         img_right = cv2.resize(img_right, (640, 480))
 
-        return img_front, img_left, img_right, master_left, master_right
+        return (
+            img_front,
+            img_left,
+            img_right,
+            master_left,
+            master_right,
+            puppet_left,
+            puppet_right,
+        )
 
     def process(self):
-        print("等待相机和主臂数据...")
+        print("等待相机、主臂和从臂数据...")
         rate = rospy.Rate(50)
         t0 = time.time()
+        topic_names = [
+            self.args.img_front_topic,
+            self.args.img_left_topic,
+            self.args.img_right_topic,
+            self.args.master_arm_left_topic,
+            self.args.master_arm_right_topic,
+            self.args.puppet_arm_left_topic,
+            self.args.puppet_arm_right_topic,
+        ]
         while not rospy.is_shutdown():
-            if (
-                len(self.img_front_deque) > 0
-                and len(self.img_left_deque) > 0
-                and len(self.img_right_deque) > 0
-                and len(self.master_arm_left_deque) > 0
-                and len(self.master_arm_right_deque) > 0
-            ):
+            if all(len(dq) > 0 for dq in self._all_deques()):
                 print("\033[32m所有数据源就绪!\033[0m")
                 break
             if time.time() - t0 > 15.0:
-                print("\033[31m等待数据超时! 请检查相机和主臂节点是否已启动.\033[0m")
-                missing = []
-                if len(self.img_front_deque) == 0:
-                    missing.append(self.args.img_front_topic)
-                if len(self.img_left_deque) == 0:
-                    missing.append(self.args.img_left_topic)
-                if len(self.img_right_deque) == 0:
-                    missing.append(self.args.img_right_topic)
-                if len(self.master_arm_left_deque) == 0:
-                    missing.append(self.args.master_arm_left_topic)
-                if len(self.master_arm_right_deque) == 0:
-                    missing.append(self.args.master_arm_right_topic)
+                print("\033[31m等待数据超时! 请检查相机/主臂/从臂节点是否已启动.\033[0m")
+                missing = [
+                    name
+                    for name, dq in zip(topic_names, self._all_deques())
+                    if len(dq) == 0
+                ]
                 print(f"  缺失话题: {missing}")
                 return [], []
             rate.sleep()
 
-        print("等待主臂 CAN 数据稳定...")
+        print("等待主/从臂 CAN 数据稳定...")
         t_can = time.time()
         while not rospy.is_shutdown():
             def _arm_valid(dq):
@@ -236,11 +283,16 @@ class RosOperator:
                 pos = list(dq[-1].position)
                 return any(abs(v) > 1e-4 for v in pos[:6])
 
-            if _arm_valid(self.master_arm_left_deque) and _arm_valid(self.master_arm_right_deque):
-                print("\033[32m主臂 CAN 数据已稳定（非零）!\033[0m")
+            if (
+                _arm_valid(self.master_arm_left_deque)
+                and _arm_valid(self.master_arm_right_deque)
+                and _arm_valid(self.puppet_arm_left_deque)
+                and _arm_valid(self.puppet_arm_right_deque)
+            ):
+                print("\033[32m主/从臂 CAN 数据已稳定（非零）!\033[0m")
                 break
             if time.time() - t_can > 5.0:
-                print("\033[33m[warn] 主臂关节数据仍为零，可能臂在机械零位，继续录制...\033[0m")
+                print("\033[33m[warn] 主/从臂关节数据仍为零，可能臂在机械零位，继续录制...\033[0m")
                 break
             rate.sleep()
 
@@ -264,16 +316,30 @@ class RosOperator:
             print_flag = True
             count += 1
 
-            img_front, img_left, img_right, master_left, master_right = result
+            (
+                img_front,
+                img_left,
+                img_right,
+                master_left,
+                master_right,
+                puppet_left,
+                puppet_right,
+            ) = result
 
+            # observation <- 从臂(puppet) 实际状态
             qpos = np.concatenate(
-                (np.array(master_left.position), np.array(master_right.position)), axis=0
+                (np.array(puppet_left.position), np.array(puppet_right.position)), axis=0
             )
             qvel = np.concatenate(
-                (np.array(master_left.velocity), np.array(master_right.velocity)), axis=0
+                (np.array(puppet_left.velocity), np.array(puppet_right.velocity)), axis=0
             )
             effort = np.concatenate(
-                (np.array(master_left.effort), np.array(master_right.effort)), axis=0
+                (np.array(puppet_left.effort), np.array(puppet_right.effort)), axis=0
+            )
+
+            # action <- 主臂(master) 下发指令
+            action = np.concatenate(
+                (np.array(master_left.position), np.array(master_right.position)), axis=0
             )
 
             obs = {
@@ -286,7 +352,6 @@ class RosOperator:
                     self.args.camera_names[2]: img_right,
                 },
             }
-            action = qpos.copy()
 
             if count == 1:
                 timesteps.append(obs)
@@ -303,9 +368,9 @@ class RosOperator:
 
 
 def get_arguments():
-    parser = argparse.ArgumentParser(description="主臂+相机数据采集(无从臂)")
+    parser = argparse.ArgumentParser(description="主从遥操+相机 数据采集")
     parser.add_argument("--dataset_dir", type=str, default="./data")
-    parser.add_argument("--task_name", type=str, default="aloha_master_cam")
+    parser.add_argument("--task_name", type=str, default="aloha_master_slave_cam")
     parser.add_argument("--episode_idx", type=int, default=0)
     parser.add_argument("--max_timesteps", type=int, default=500)
     parser.add_argument(
@@ -319,6 +384,8 @@ def get_arguments():
     parser.add_argument("--img_right_topic", type=str, default="/camera_r/color/image_raw")
     parser.add_argument("--master_arm_left_topic", type=str, default="/master/joint_left")
     parser.add_argument("--master_arm_right_topic", type=str, default="/master/joint_right")
+    parser.add_argument("--puppet_arm_left_topic", type=str, default="/puppet/joint_left")
+    parser.add_argument("--puppet_arm_right_topic", type=str, default="/puppet/joint_right")
     parser.add_argument("--frame_rate", type=int, default=30)
     parser.add_argument("--jpeg_quality", type=int, default=90)
     return parser.parse_args()

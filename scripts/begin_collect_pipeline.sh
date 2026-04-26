@@ -8,10 +8,6 @@ source /home/agilex/miniconda3/etc/profile.d/conda.sh
 conda activate aloha
 cd ~/cobot_magic/collect_data/piper_sdk_demo
 
-python3 master_arm_control.py --can can_left --to-master
-python3 master_arm_control.py --can can_right --to-master
-read -rp $'\n[INFO] 请手动断电重启两臂，完成后按 Enter 键继续...\n'
-
 DATASET_DIR=${DATASET_DIR:-~/data}
 TASK_NAME=${TASK_NAME:-aloha_pipeline}
 MAX_TIMESTEPS=${MAX_TIMESTEPS:-9000}
@@ -33,19 +29,30 @@ until bash -lc "$SETUP_CMD && rostopic list >/dev/null 2>&1"; do
     sleep 1
 done
 
-tmux new-window -t "$SESSION" -n "piper_master"
+tmux new-window -t "$SESSION" -n "piper_ms"
+# CAN 重新配置后需要 2-3s 稳定; piper_sdk 首次 open CAN 偶发 ConnectionError -> 自动重试
 tmux send-keys -t "$SESSION:1" "$SETUP_CMD && \
 cd ~/cobot_magic/Piper_ros_private-ros-noetic/ && \
-bash can_muti_activate.sh && \
-cd ~/cobot_magic/piper_ws/ && \
+bash can_config.sh && \
+sleep 3 && \
 source devel/setup.bash && \
-roslaunch piper start_master_aloha.launch" Enter
+until roslaunch piper start_ms_piper.launch mode:=0 auto_enable:=false; do \
+    echo '[WARN] roslaunch exited, retry in 3s...'; sleep 3; \
+done" Enter
 
 echo "[INFO] waiting for master-arm topics..."
 until bash -lc "$SETUP_CMD && rostopic list | grep -q '^/master/joint_left$'"; do
     sleep 1
 done
 until bash -lc "$SETUP_CMD && rostopic list | grep -q '^/master/joint_right$'"; do
+    sleep 1
+done
+
+echo "[INFO] waiting for puppet-arm topics..."
+until bash -lc "$SETUP_CMD && rostopic list | grep -q '^/puppet/joint_left$'"; do
+    sleep 1
+done
+until bash -lc "$SETUP_CMD && rostopic list | grep -q '^/puppet/joint_right$'"; do
     sleep 1
 done
 

@@ -233,6 +233,8 @@ class RosDataPump:
         self.img_right_deque = deque()
         self.master_arm_left_deque = deque()
         self.master_arm_right_deque = deque()
+        self.puppet_arm_left_deque = deque()
+        self.puppet_arm_right_deque = deque()
 
         # Wall-clock time of last received message for each stream
         _now = time.time()
@@ -242,6 +244,8 @@ class RosDataPump:
             "right":        _now,
             "arm_left":     _now,
             "arm_right":    _now,
+            "puppet_left":  _now,
+            "puppet_right": _now,
         }
 
         rospy.Subscriber(args.img_front_topic, Image, self._img_front_cb, queue_size=1000, tcp_nodelay=True)
@@ -250,6 +254,10 @@ class RosDataPump:
         rospy.Subscriber(args.master_arm_left_topic, JointState, self._master_left_cb,
                          queue_size=1000, tcp_nodelay=True)
         rospy.Subscriber(args.master_arm_right_topic, JointState, self._master_right_cb,
+                         queue_size=1000, tcp_nodelay=True)
+        rospy.Subscriber(args.puppet_arm_left_topic, JointState, self._puppet_left_cb,
+                         queue_size=1000, tcp_nodelay=True)
+        rospy.Subscriber(args.puppet_arm_right_topic, JointState, self._puppet_right_cb,
                          queue_size=1000, tcp_nodelay=True)
 
     def _img_front_cb(self, msg):
@@ -282,6 +290,18 @@ class RosDataPump:
             self.master_arm_right_deque.popleft()
         self.master_arm_right_deque.append(msg)
 
+    def _puppet_left_cb(self, msg):
+        self._last_recv["puppet_left"] = time.time()
+        if len(self.puppet_arm_left_deque) >= 2000:
+            self.puppet_arm_left_deque.popleft()
+        self.puppet_arm_left_deque.append(msg)
+
+    def _puppet_right_cb(self, msg):
+        self._last_recv["puppet_right"] = time.time()
+        if len(self.puppet_arm_right_deque) >= 2000:
+            self.puppet_arm_right_deque.popleft()
+        self.puppet_arm_right_deque.append(msg)
+
     @staticmethod
     def _arm_valid(dq):
         if not dq:
@@ -293,11 +313,13 @@ class RosDataPump:
         """Return list of stream keys whose last message is older than timeout seconds."""
         now = time.time()
         key_to_topic = {
-            "front":    self.args.img_front_topic,
-            "left":     self.args.img_left_topic,
-            "right":    self.args.img_right_topic,
-            "arm_left": self.args.master_arm_left_topic,
-            "arm_right": self.args.master_arm_right_topic,
+            "front":        self.args.img_front_topic,
+            "left":         self.args.img_left_topic,
+            "right":        self.args.img_right_topic,
+            "arm_left":     self.args.master_arm_left_topic,
+            "arm_right":    self.args.master_arm_right_topic,
+            "puppet_left":  self.args.puppet_arm_left_topic,
+            "puppet_right": self.args.puppet_arm_right_topic,
         }
         return [key_to_topic[k] for k, t in self._last_recv.items() if now - t > timeout]
 
@@ -308,6 +330,8 @@ class RosDataPump:
             and len(self.img_right_deque) > 0
             and len(self.master_arm_left_deque) > 0
             and len(self.master_arm_right_deque) > 0
+            and len(self.puppet_arm_left_deque) > 0
+            and len(self.puppet_arm_right_deque) > 0
         )
 
     def wait_until_ready(self, timeout=15.0):
@@ -323,13 +347,18 @@ class RosDataPump:
                 if len(self.img_right_deque) == 0: missing.append(self.args.img_right_topic)
                 if len(self.master_arm_left_deque) == 0: missing.append(self.args.master_arm_left_topic)
                 if len(self.master_arm_right_deque) == 0: missing.append(self.args.master_arm_right_topic)
+                if len(self.puppet_arm_left_deque) == 0: missing.append(self.args.puppet_arm_left_topic)
+                if len(self.puppet_arm_right_deque) == 0: missing.append(self.args.puppet_arm_right_topic)
                 raise RuntimeError(f"Timed out waiting for topics: {missing}")
             rate.sleep()
 
         # warm up: wait for non-zero CAN values
         t_can = time.time()
         while not rospy.is_shutdown():
-            if self._arm_valid(self.master_arm_left_deque) and self._arm_valid(self.master_arm_right_deque):
+            if (self._arm_valid(self.master_arm_left_deque)
+                    and self._arm_valid(self.master_arm_right_deque)
+                    and self._arm_valid(self.puppet_arm_left_deque)
+                    and self._arm_valid(self.puppet_arm_right_deque)):
                 return
             if time.time() - t_can > 5.0:
                 print("[WARN] Joint data still near zero; continue anyway.")
@@ -345,6 +374,8 @@ class RosDataPump:
             self.img_right_deque[-1].header.stamp.to_sec(),
             self.master_arm_left_deque[-1].header.stamp.to_sec(),
             self.master_arm_right_deque[-1].header.stamp.to_sec(),
+            self.puppet_arm_left_deque[-1].header.stamp.to_sec(),
+            self.puppet_arm_right_deque[-1].header.stamp.to_sec(),
         )
 
         while self.img_front_deque[0].header.stamp.to_sec() < frame_time:
@@ -367,10 +398,18 @@ class RosDataPump:
             self.master_arm_right_deque.popleft()
         master_right = self.master_arm_right_deque.popleft()
 
+        while self.puppet_arm_left_deque[0].header.stamp.to_sec() < frame_time:
+            self.puppet_arm_left_deque.popleft()
+        puppet_left = self.puppet_arm_left_deque.popleft()
+
+        while self.puppet_arm_right_deque[0].header.stamp.to_sec() < frame_time:
+            self.puppet_arm_right_deque.popleft()
+        puppet_right = self.puppet_arm_right_deque.popleft()
+
         img_front = cv2.resize(img_front, (640, 480))
         img_left = cv2.resize(img_left, (640, 480))
         img_right = cv2.resize(img_right, (640, 480))
-        return img_front, img_left, img_right, master_left, master_right
+        return img_front, img_left, img_right, master_left, master_right, puppet_left, puppet_right
 
 
 # ------------------------------------------------------------------
@@ -458,11 +497,17 @@ class CollectorWorker(threading.Thread):
             rate.sleep()
 
     def _append_step(self, result):
-        img_front, img_left, img_right, master_left, master_right = result
+        (img_front, img_left, img_right,
+         master_left, master_right,
+         puppet_left, puppet_right) = result
 
-        qpos = np.concatenate((np.array(master_left.position), np.array(master_right.position)), axis=0)
-        qvel = np.concatenate((np.array(master_left.velocity), np.array(master_right.velocity)), axis=0)
-        effort = np.concatenate((np.array(master_left.effort), np.array(master_right.effort)), axis=0)
+        # observation <- 从臂 (puppet) 实际状态
+        qpos = np.concatenate((np.array(puppet_left.position), np.array(puppet_right.position)), axis=0)
+        qvel = np.concatenate((np.array(puppet_left.velocity), np.array(puppet_right.velocity)), axis=0)
+        effort = np.concatenate((np.array(puppet_left.effort), np.array(puppet_right.effort)), axis=0)
+
+        # action <- 主臂 (master) 下发指令
+        action = np.concatenate((np.array(master_left.position), np.array(master_right.position)), axis=0)
 
         obs = {
             "qpos": qpos,
@@ -474,7 +519,6 @@ class CollectorWorker(threading.Thread):
                 self.args.camera_names[2]: img_right,
             },
         }
-        action = qpos.copy()
 
         with self._lock:
             ep = self._episode
@@ -654,12 +698,18 @@ class CollectorApp:
             try:
                 self.ui_queue.put(("status", "Waiting for ROS topics..."))
                 self.pump.wait_until_ready()
-                self.controller.start()
-                self.worker.start()
-                self.ui_queue.put(("status", "Ready. Select an instruction and press Start (or pedal)."))
-                self.ui_queue.put(("ready", True))
             except Exception as exc:
-                self.ui_queue.put(("status", f"[ERROR] init: {exc}"))
+                self.ui_queue.put(("status", f"[ERROR] wait_until_ready: {exc}"))
+                return
+            # Start collector worker first so buttons always work
+            self.worker.start()
+            # Controller (lamp + pedal) may fail gracefully if hardware absent
+            try:
+                self.controller.start()
+            except Exception as exc:
+                self.ui_queue.put(("status", f"[WARN] pedal/lamp unavailable: {exc}"))
+            self.ui_queue.put(("status", "Ready. Select an instruction and press Start (or pedal)."))
+            self.ui_queue.put(("ready", True))
         threading.Thread(target=_wait, daemon=True).start()
 
     # ---- instruction management ----
@@ -870,6 +920,8 @@ def get_arguments():
     parser.add_argument("--img_right_topic", type=str, default="/camera_r/color/image_raw")
     parser.add_argument("--master_arm_left_topic", type=str, default="/master/joint_left")
     parser.add_argument("--master_arm_right_topic", type=str, default="/master/joint_right")
+    parser.add_argument("--puppet_arm_left_topic", type=str, default="/puppet/joint_left")
+    parser.add_argument("--puppet_arm_right_topic", type=str, default="/puppet/joint_right")
     parser.add_argument("--frame_rate", type=int, default=30)
     parser.add_argument("--jpeg_quality", type=int, default=90)
     parser.add_argument("--lamp_port", type=str, default=None)
