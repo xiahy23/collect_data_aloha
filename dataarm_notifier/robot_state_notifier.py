@@ -16,6 +16,7 @@ class RobotState(Enum):
     IDLE = "idle"
     TEACH = "teach"
     SAVING = "saving"
+    HOMING = "homing"
     EXECUTE_STOPPED = "execute_stopped"
     EXECUTE_RUNNING = "execute_running"
     ERROR = "error"
@@ -65,6 +66,7 @@ class RobotStateNotifier:
             RobotState.IDLE: self._lamp.set_cyan,
             RobotState.TEACH: self._lamp.set_green,
             RobotState.SAVING: self._lamp.set_yellow,
+            RobotState.HOMING: self._lamp.set_magenta,
             RobotState.EXECUTE_STOPPED: self._lamp.set_blue,
             RobotState.EXECUTE_RUNNING: self._lamp.set_white,
             RobotState.ERROR: self._lamp.set_red,
@@ -84,6 +86,9 @@ class RobotStateNotifier:
 
     def saving(self):
         self.set_state(RobotState.SAVING)
+
+    def homing(self):
+        self.set_state(RobotState.HOMING)
 
     def error(self):
         self.set_state(RobotState.ERROR)

@@ -433,6 +433,7 @@ class CollectorWorker(threading.Thread):
         self._episode = None
         self._episode_meta = None  # dict(folder, idx, instruction)
         self._stall_since = None   # wall time when frames first stopped arriving
+        self._last_front = None    # most recent front-cam frame for end-thumb
 
     # ---- control API (thread-safe, called from UI / pedal) ----
     def request_stop_thread(self):
@@ -529,9 +530,14 @@ class CollectorWorker(threading.Thread):
             count = ep["count"]
             if count == 1:
                 ep["timesteps"].append(obs)
+                # Push the very first frame as the "episode start" thumbnail
+                self.ui_queue.put(("episode_first_frame", img_front.copy()))
                 return
             ep["actions"].append(action)
             ep["timesteps"].append(obs)
+            # Continuously update "last seen" frame; on stop we publish it
+            # as the "episode end" thumbnail.
+            self._last_front = img_front
             if count % 50 == 0:
                 self.ui_queue.put(("frames", count - 1))
             if len(ep["actions"]) >= self.args.max_timesteps:
@@ -570,6 +576,8 @@ class CollectorWorker(threading.Thread):
             self.ui_queue.put(("recording", False))
             return
 
+        if self._last_front is not None:
+            self.ui_queue.put(("episode_last_frame", self._last_front.copy()))
         self.ui_queue.put(("saving", True))
         save_ok = False
         try:
@@ -611,6 +619,18 @@ class CollectorWorker(threading.Thread):
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
 
+try:
+    # NOTE: do NOT do `from PIL import Image` — it would shadow
+    # `sensor_msgs.msg.Image` imported above and break rospy.Subscriber.
+    from PIL import Image as PILImage
+    from PIL import ImageTk
+    _PIL_AVAILABLE = True
+except Exception as _pil_exc:  # pragma: no cover - graceful fallback
+    _PIL_AVAILABLE = False
+    PILImage = None
+    ImageTk = None
+    print(f"[WARN] Pillow not available, live preview disabled: {_pil_exc}")
+
 
 class CollectorApp:
     def __init__(self, args):
@@ -647,7 +667,7 @@ class CollectorApp:
         # ----- Build UI -----
         self.root = tk.Tk()
         self.root.title("Data Collection Pipeline")
-        self.root.geometry("780x560")
+        self.root.geometry("1440x820")
         self._build_ui()
 
         # state
@@ -657,6 +677,9 @@ class CollectorApp:
         self.root.after(100, self._async_init)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(100, self._poll_queue)
+        # Live camera preview runs on a background thread so that UI
+        # rendering and image decoding never block the collector worker.
+        # Started after ROS topics are ready, see _async_init.
 
     # ---- UI construction ----
     def _build_ui(self):
@@ -669,7 +692,7 @@ class CollectorApp:
         ttk.Label(top, text="Dir:").pack(side=tk.LEFT)
         ttk.Label(top, text=self.task_dir).pack(side=tk.LEFT)
 
-        # Instructions panel (left) + Episodes panel (right)
+        # Instructions panel (left) + Episodes panel (middle) + Camera preview (right)
         body = ttk.Frame(self.root)
         body.pack(fill=tk.BOTH, expand=True, **pad)
 
@@ -684,14 +707,38 @@ class CollectorApp:
         ttk.Button(instr_btns, text="Add", command=self._add_instruction).pack(side=tk.LEFT)
         ttk.Button(instr_btns, text="Remove", command=self._remove_instruction).pack(side=tk.LEFT, padx=4)
 
-        right = ttk.LabelFrame(body, text="Episodes for selected instruction")
-        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4, pady=4)
-        self.episode_list = tk.Listbox(right, exportselection=False)
+        middle = ttk.LabelFrame(body, text="Episodes for selected instruction")
+        middle.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4, pady=4)
+        self.episode_list = tk.Listbox(middle, exportselection=False)
         self.episode_list.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
-        ep_btns = ttk.Frame(right)
+        ep_btns = ttk.Frame(middle)
         ep_btns.pack(fill=tk.X, padx=4, pady=4)
         ttk.Button(ep_btns, text="Delete selected episode", command=self._delete_episode).pack(side=tk.LEFT)
         ttk.Button(ep_btns, text="Refresh", command=self._refresh_episodes).pack(side=tk.LEFT, padx=4)
+
+        # ---- Camera preview + start/end frame thumbnails ----
+        right = ttk.LabelFrame(body, text="Live cameras  /  Episode frames")
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+        live = ttk.LabelFrame(right, text="Live (front | left | right)")
+        live.pack(fill=tk.X, padx=4, pady=4)
+        self.preview_label = ttk.Label(live, text="(waiting for camera frames...)",
+                                       anchor="center")
+        self.preview_label.pack(fill=tk.X, padx=4, pady=4)
+        self._preview_photo = None  # keep ref so PhotoImage isn'\''t GCd
+
+        thumbs = ttk.Frame(right)
+        thumbs.pack(fill=tk.X, padx=4, pady=4)
+        first_box = ttk.LabelFrame(thumbs, text="Episode start (frame 0)")
+        first_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=2)
+        self.first_label = ttk.Label(first_box, text="(no episode yet)", anchor="center")
+        self.first_label.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        self._first_photo = None
+        last_box = ttk.LabelFrame(thumbs, text="Episode end (final frame)")
+        last_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=2)
+        self.last_label = ttk.Label(last_box, text="(no episode yet)", anchor="center")
+        self.last_label.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        self._last_photo = None
 
         # Control buttons
         ctl = ttk.LabelFrame(self.root, text="Control")
@@ -702,6 +749,9 @@ class CollectorApp:
         self.btn_stop.pack(side=tk.LEFT, padx=6, pady=6)
         self.btn_next = ttk.Button(ctl, text="Stop & Start Next", command=self._on_next, state=tk.DISABLED)
         self.btn_next.pack(side=tk.LEFT, padx=6, pady=6)
+        ttk.Separator(ctl, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
+        self.btn_home = ttk.Button(ctl, text="Go Home (主从臂归零)", command=self._on_go_home)
+        self.btn_home.pack(side=tk.LEFT, padx=6, pady=6)
 
         # Status bar
         self.status_var = tk.StringVar(value="Initializing...")
@@ -724,6 +774,12 @@ class CollectorApp:
                 return
             # Start collector worker first so buttons always work
             self.worker.start()
+            # Live preview runs in its own thread (zero work on UI thread or
+            # collector worker thread), so safe to start now.
+            try:
+                self._start_preview_thread()
+            except Exception as exc:
+                print(f"[WARN] preview thread unavailable: {exc}")
             # Controller (lamp + pedal) may fail gracefully if hardware absent
             try:
                 self.controller.start()
@@ -892,10 +948,32 @@ class CollectorApp:
                 elif kind == "homing":
                     if payload:
                         self._set_lamp("#cc66ff")  # purple
+                        # Drive the *hardware* USB lamp purple as well.  The
+                        # previous code only updated the on-screen indicator
+                        # so the physical lamp stayed yellow during homing.
+                        try:
+                            self.controller._notifier.homing()  # noqa: SLF001
+                        except Exception as exc:
+                            print(f"[WARN] could not set hardware lamp to homing: {exc}")
                         self.btn_start.config(state=tk.DISABLED)
                         self.btn_stop.config(state=tk.DISABLED)
                         self.btn_next.config(state=tk.DISABLED)
+                        try:
+                            self.btn_home.config(state=tk.DISABLED)
+                        except Exception:
+                            pass
                         self.status_var.set("Returning to home (master+slave)...")
+                    else:
+                        try:
+                            self.btn_home.config(state=tk.NORMAL)
+                        except Exception:
+                            pass
+                elif kind == "live_preview_image":
+                    self._render_preview(payload)
+                elif kind == "first_frame_image":
+                    self._set_thumb(self.first_label, "_first_photo", payload)
+                elif kind == "last_frame_image":
+                    self._set_thumb(self.last_label, "_last_photo", payload)
                 elif kind == "home_result":
                     if payload:
                         self.status_var.set("Home reached. Ready for next episode.")
@@ -903,6 +981,10 @@ class CollectorApp:
                         self.status_var.set("[WARN] Home timeout/failure. Please verify arms manually.")
                 elif kind == "frames":
                     self.status_var.set(f"Recording... {payload}/{self.args.max_timesteps} frames")
+                elif kind == "episode_first_frame":
+                    self._publish_thumb_async("first_frame_image", payload)
+                elif kind == "episode_last_frame":
+                    self._publish_thumb_async("last_frame_image", payload)
                 elif kind == "episode_aborted":
                     reason = payload
                     self.status_var.set(f"[ABORTED] {reason}")
@@ -935,12 +1017,186 @@ class CollectorApp:
         except Exception:
             pass
 
+    # ---- Go Home button ----
+    def _on_go_home(self):
+        if self.worker.is_recording():
+            messagebox.showwarning("Busy", "Cannot home while recording. Stop first.")
+            return
+        if getattr(self, "_homing_in_progress", False):
+            return
+        self._homing_in_progress = True
+        self.ui_queue.put(("homing", True))
+
+        def _do_home():
+            try:
+                ok = go_home_and_wait(
+                    pos_threshold=self.args.home_pos_threshold,
+                    vel_threshold=self.args.home_vel_threshold,
+                    stable_seconds=self.args.home_stable_seconds,
+                    timeout=self.args.home_timeout,
+                    log=lambda m: self.ui_queue.put(("status", m)),
+                )
+            except Exception as exc:
+                self.ui_queue.put(("status", f"[ERROR] manual homing: {exc}"))
+                ok = False
+            self.ui_queue.put(("homing", False))
+            self.ui_queue.put(("home_result", ok))
+            # Restore idle lamp on hardware once homing finishes
+            try:
+                self.controller._notifier.idle()  # noqa: SLF001
+            except Exception:
+                pass
+            self._homing_in_progress = False
+
+        threading.Thread(target=_do_home, daemon=True).start()
+
+    # ---- Live preview ----
+    #
+    # Design notes (避免影响数据采集):
+    #   * 全部 cv_bridge 解码 / resize / hstack / cvtColor / PIL 转换都在
+    #     独立后台线程里做, UI 主线程只负责把 PIL.Image 包成 PhotoImage 并
+    #     贴到 Label 上, 因此 UI 卡顿不会拖累采集 worker.
+    #   * 录制中刷新率降到 1 FPS, 空闲时 5 FPS, 给采集线程让出 CPU/GIL.
+    #   * 仅 peek (`deque[-1]`) **不** popleft, 不会影响采集 worker 从
+    #     队首消费帧的逻辑; 也不修改任何已入队的 ROS 消息.
+    #   * 使用专属 CvBridge, 与 RosDataPump.bridge 隔离.
+    #   * 使用 `_pending_preview` 标志避免向 UI 队列堆积积压.
+    def _start_preview_thread(self):
+        if not _PIL_AVAILABLE:
+            return
+        if getattr(self, "_preview_thread", None) is not None:
+            return
+        self._preview_stop = threading.Event()
+        self._pending_preview = False
+        self._preview_bridge = CvBridge()
+        self._last_preview_msg_ids = (None, None, None)
+        self._preview_thread = threading.Thread(
+            target=self._preview_loop, daemon=True, name="preview"
+        )
+        self._preview_thread.start()
+
+    def _stop_preview_thread(self):
+        evt = getattr(self, "_preview_stop", None)
+        if evt is not None:
+            evt.set()
+
+    def _preview_loop(self):
+        idle_period = 0.2     # 5 FPS when not recording
+        busy_period = 1.0     # 1 FPS during recording, minimal interference
+        while not self._preview_stop.is_set():
+            t0 = time.time()
+            recording = self.worker.is_recording() if hasattr(self, "worker") else False
+            period = busy_period if recording else idle_period
+
+            # Skip work entirely if UI hasn't yet drained the previous frame
+            # (prevents queue buildup if the UI thread stalls).
+            if self._pending_preview:
+                time.sleep(period)
+                continue
+
+            try:
+                tile = self._compose_live_tile_safe()
+            except Exception as exc:
+                print(f"[WARN] preview compose failed: {exc}")
+                tile = None
+
+            if tile is not None:
+                self._pending_preview = True
+                self.ui_queue.put(("live_preview_image", tile))
+
+            elapsed = time.time() - t0
+            sleep_for = period - elapsed
+            if sleep_for > 0:
+                # Use Event.wait so stop is responsive
+                self._preview_stop.wait(sleep_for)
+
+    def _compose_live_tile_safe(self):
+        # Snapshot latest message refs without popping the deques. CPython
+        # deque indexing is atomic at the C level, but the deque can briefly
+        # be empty between the len() check and the [-1] read, so we guard
+        # with try/except.
+        front_msg = left_msg = right_msg = None
+        try:
+            if len(self.pump.img_front_deque):
+                front_msg = self.pump.img_front_deque[-1]
+            if len(self.pump.img_left_deque):
+                left_msg = self.pump.img_left_deque[-1]
+            if len(self.pump.img_right_deque):
+                right_msg = self.pump.img_right_deque[-1]
+        except IndexError:
+            return None
+        if front_msg is None or left_msg is None or right_msg is None:
+            return None
+
+        # De-duplicate: if all three msg refs are the same as last cycle,
+        # there is no new content to display, skip the decode entirely.
+        msg_ids = (id(front_msg), id(left_msg), id(right_msg))
+        if msg_ids == self._last_preview_msg_ids:
+            return None
+        self._last_preview_msg_ids = msg_ids
+
+        try:
+            front = self._preview_bridge.imgmsg_to_cv2(front_msg, "bgr8")
+            left = self._preview_bridge.imgmsg_to_cv2(left_msg, "bgr8")
+            right = self._preview_bridge.imgmsg_to_cv2(right_msg, "bgr8")
+        except Exception:
+            return None
+        target_w = 320
+        target_h = 240
+        front = cv2.resize(front, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+        left = cv2.resize(left, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+        right = cv2.resize(right, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
+        composite = np.hstack([front, left, right])
+        rgb = cv2.cvtColor(composite, cv2.COLOR_BGR2RGB)
+        return PILImage.fromarray(rgb)
+
+    def _publish_thumb_async(self, kind, bgr_img):
+        """Convert a captured BGR frame to a PhotoImage on the UI thread."""
+        if not _PIL_AVAILABLE:
+            return
+        try:
+            small = cv2.resize(bgr_img, (240, 180))
+            rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+            pil = PILImage.fromarray(rgb)
+            photo = ImageTk.PhotoImage(pil)
+        except Exception as exc:
+            print(f"[WARN] thumb conversion failed: {exc}")
+            return
+        if kind == "first_frame_image":
+            self.first_label.configure(image=photo, text="")
+            self._first_photo = photo
+        elif kind == "last_frame_image":
+            self.last_label.configure(image=photo, text="")
+            self._last_photo = photo
+
+    def _set_thumb(self, label, attr, photo):
+        # placeholder kept for symmetry; thumbs are pushed via
+        # _publish_thumb_async directly
+        pass
+
+    def _render_preview(self, pil_image):
+        """Called on UI thread. Cheap: PIL.Image -> PhotoImage -> label."""
+        try:
+            if pil_image is None:
+                return
+            photo = ImageTk.PhotoImage(pil_image)
+            self.preview_label.configure(image=photo, text="")
+            self._preview_photo = photo
+        except Exception as exc:
+            print(f"[WARN] preview render failed: {exc}")
+        finally:
+            self._pending_preview = False
+
     # ---- shutdown ----
     def _on_close(self):
         if self.is_recording_ui:
             if not messagebox.askyesno("Quit", "An episode is being recorded. Quit anyway?"):
                 return
         self.worker.request_stop_thread()
+        try:
+            self._stop_preview_thread()
+        except Exception:
+            pass
         try:
             self.controller.stop()
         except Exception:
@@ -992,7 +1248,7 @@ def get_arguments():
                         help="回零完成速度阈值")
     parser.add_argument("--home_stable_seconds", type=float, default=0.2,
                         help="满足阈值的持续时间")
-    parser.add_argument("--home_timeout", type=float, default=6.0,
+    parser.add_argument("--home_timeout", type=float, default=4.5,
                         help="回零等待超时 (s)")
     return parser.parse_args()
 

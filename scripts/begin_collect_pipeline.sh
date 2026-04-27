@@ -11,6 +11,7 @@ cd ~/cobot_magic/collect_data/piper_sdk_demo
 DATASET_DIR=${DATASET_DIR:-~/data}
 TASK_NAME=${TASK_NAME:-aloha_pipeline}
 MAX_TIMESTEPS=${MAX_TIMESTEPS:-9000}
+LAMP_PORT=${LAMP_PORT:-/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0}
 SESSION=${SESSION:-collect_pipeline}
 
 SETUP_CMD="source /home/agilex/miniconda3/etc/profile.d/conda.sh; \
@@ -73,6 +74,7 @@ cd ~/cobot_magic/collect_data/scripts && \
 python collect_data_pipeline.py \
     --dataset_dir ${DATASET_DIR} \
     --task_name ${TASK_NAME} \
+    --lamp_port ${LAMP_PORT} \
     --max_timesteps ${MAX_TIMESTEPS}" Enter
 
 tmux select-window -t "$SESSION:3"

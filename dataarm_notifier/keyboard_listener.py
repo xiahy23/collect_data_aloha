@@ -111,6 +111,17 @@ class KeyboardListener:
         try:
             self._device = InputDevice(resolved_path)
             self.device_path = resolved_path
+            # Grab the device exclusively so pedal key events (KEY_ENTER) do
+            # not also propagate to whatever window has UI focus.  Without
+            # this, pressing the pedal while a Tk button has focus can
+            # accidentally activate that button or insert newlines into the
+            # focused terminal, which makes the pedal feel "broken" after
+            # any UI interaction.
+            try:
+                self._device.grab()
+                print(f"[INFO] pedal device grabbed exclusively: {resolved_path}")
+            except Exception as grab_exc:
+                print(f"[WARN] could not grab pedal device exclusively: {grab_exc}")
             print(
                 f"[INFO] pedal listener attached to {resolved_path} "
                 f"(trigger key: {self.trigger_key})"
@@ -128,6 +139,10 @@ class KeyboardListener:
             print(f"[WARN] pedal listener stopped: {exc}")
         finally:
             if self._device is not None:
+                try:
+                    self._device.ungrab()
+                except Exception:
+                    pass
                 try:
                     self._device.close()
                 except Exception:
