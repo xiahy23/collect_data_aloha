@@ -1,18 +1,17 @@
 #!/bin/bash
 set -euo pipefail
 
-# UI + pedal data-collection pipeline launcher.
-# Mirrors start_collect_pedal.sh but launches the new pipeline collector.
+# UI + pedal data-collection pipeline launcher for the shape-to-hole task.
 
 source /home/agilex/miniconda3/etc/profile.d/conda.sh
 conda activate aloha
 cd ~/cobot_magic/collect_data/piper_sdk_demo
 
 DATASET_DIR=${DATASET_DIR:-~/data}
-TASK_NAME=${TASK_NAME:-aloha_pipeline}
+TASK_NAME=${TASK_NAME:-shape_hole_pipeline}
 MAX_TIMESTEPS=${MAX_TIMESTEPS:-9000}
 LAMP_PORT=${LAMP_PORT:-/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0}
-SESSION=${SESSION:-collect_pipeline}
+SESSION=${SESSION:-collect_shape_holes}
 
 SETUP_CMD="source /home/agilex/miniconda3/etc/profile.d/conda.sh; \
 source /home/agilex/cobot_magic/Piper_ros_private-ros-noetic/devel/setup.bash; \
@@ -71,7 +70,7 @@ done
 tmux new-window -t "$SESSION" -n "collect"
 tmux send-keys -t "$SESSION:3" "$SETUP_CMD && \
 cd ~/cobot_magic/collect_data/scripts && \
-python collect_data_pipeline_subtask.py \
+python collect_data_pipeline_shape_holes.py \
     --dataset_dir ${DATASET_DIR} \
     --task_name ${TASK_NAME} \
     --lamp_port ${LAMP_PORT} \
